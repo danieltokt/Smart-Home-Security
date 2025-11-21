@@ -1,6 +1,8 @@
+// lib/main.dart
+
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'services/auth_service.dart';
+import 'services/auth_service.dart';  // AuthService
 import 'screens/login_screen.dart';
 import 'screens/admin_screen.dart';
 import 'screens/user_screen.dart';
@@ -8,8 +10,11 @@ import 'screens/user_screen.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // Запрос Bluetooth разрешений
-  await _requestPermissions();
+  // Запрос Bluetooth разрешений (не блокирует приложение)
+  _requestPermissions();
+  
+  // Инициализация AuthService (загрузка пользователей из SharedPreferences)
+  await AuthService.init();
   
   runApp(const SmartHomeApp());
 }
@@ -62,8 +67,10 @@ class _SplashScreenState extends State<SplashScreen> {
   }
 
   Future<void> _checkSession() async {
+    // Небольшая задержка для показа splash screen
     await Future.delayed(const Duration(seconds: 2));
     
+    // Проверяем, есть ли сохранённая сессия
     final hasSession = await AuthService.restoreSession();
     
     if (mounted) {

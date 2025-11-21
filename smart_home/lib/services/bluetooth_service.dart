@@ -1,228 +1,295 @@
+// lib/services/bluetooth_service.dart
+
 import 'dart:convert';
 import 'dart:typed_data';
 import 'dart:async';
-import 'package:flutter/foundation.dart';
 import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
 
 class BluetoothService {
   static BluetoothConnection? _connection;
   static bool _isConnected = false;
   static String _connectedDeviceName = '';
-  
-  // Stream контроллеры для реактивных обновлений
+
+  // Буфер для сборки входящих данных
+  static String _inputBuffer = '';
+
+  // Очередь команд (offline режим)
+  static final List<String> _pendingCommands = [];
+
+  // Stream controllers
   static final _sensorDataController = StreamController<Map<String, double>>.broadcast();
   static final _alertController = StreamController<String>.broadcast();
+  static final _stateController = StreamController<DeviceState>.broadcast();
+  static final _fullStatusController = StreamController<FullStatus>.broadcast();
 
   static bool get isConnected => _isConnected;
   static String get connectedDeviceName => _connectedDeviceName;
-  
-  // Получить stream данных датчиков
+
   static Stream<Map<String, double>> get sensorDataStream => _sensorDataController.stream;
   static Stream<String> get alertStream => _alertController.stream;
+  static Stream<DeviceState> get stateStream => _stateController.stream;
+  static Stream<FullStatus> get fullStatusStream => _fullStatusController.stream;
 
-  // Получить список доступных Bluetooth устройств
   static Future<List<BluetoothDevice>> getPairedDevices() async {
     try {
-      final devices = await FlutterBluetoothSerial.instance.getBondedDevices();
-      print('Найдено устройств: ${devices.length}');
-      return devices;
+      return await FlutterBluetoothSerial.instance.getBondedDevices();
     } catch (e) {
-      print('Ошибка получения устройств: $e');
+      print('Ошибка получения BT устройств: $e');
       return [];
     }
   }
 
-  // Подключиться к устройству
   static Future<bool> connect(BluetoothDevice device) async {
     try {
       print('Попытка подключения к ${device.name}...');
-      
-      // Закрываем предыдущее подключение если есть
       await disconnect();
 
       _connection = await BluetoothConnection.toAddress(device.address);
       _isConnected = true;
       _connectedDeviceName = device.name ?? 'HC-06';
+      _inputBuffer = ''; // Очищаем буфер
 
       print('✅ Подключено к ${device.name}');
-      print('Адрес: ${device.address}');
-      
-      // Слушаем входящие данные
+
+      // Слушаем данные от Arduino С БУФЕРИЗАЦИЕЙ
       _connection!.input!.listen((Uint8List data) {
-        String response = utf8.decode(data).trim();
-        debugPrint('📩 Получено от Arduino: $response');
+        String chunk = utf8.decode(data);
+        _inputBuffer += chunk;
         
-        // Парсим данные датчиков
-        if (response.startsWith('SENSORS:')) {
-          _parseSensorData(response);
-        }
-        // Парсим статусы
-        else if (response.startsWith('STATUS:')) {
-          debugPrint('📊 Статус: $response');
-        }
-        // Парсим алерты
-        else if (response.startsWith('ALERT:')) {
-          debugPrint('🚨 ТРЕВОГА: $response');
-          _alertController.add(response.replaceAll('ALERT:', ''));
+        // Обрабатываем все полные строки (до \n)
+        while (_inputBuffer.contains('\n')) {
+          int idx = _inputBuffer.indexOf('\n');
+          String line = _inputBuffer.substring(0, idx).trim();
+          _inputBuffer = _inputBuffer.substring(idx + 1);
+          
+          if (line.isNotEmpty) {
+            print("📩 RX: $line");
+            _parseMessage(line);
+          }
         }
       }).onDone(() {
-        debugPrint('❌ Bluetooth соединение разорвано');
         _isConnected = false;
+        _inputBuffer = '';
+        print("❌ Соединение разорвано");
       });
-      
+
+      // Отправляем накопленные команды
+      if (_pendingCommands.isNotEmpty) _flushPending();
+
+      // Ждём стабилизации и запрашиваем статус
+      await Future.delayed(const Duration(milliseconds: 1000));
+      sendCommand('GET_STATUS');
+
       return true;
     } catch (e) {
-      print('❌ Ошибка подключения: $e');
+      print("Ошибка подключения: $e");
       _isConnected = false;
       return false;
     }
   }
-  
-  // Парсинг данных датчиков
-  static void _parseSensorData(String data) {
-    try {
-      // Формат: "SENSORS:S0:10.5,S1:15.2,S2:8.9"
-      debugPrint('Парсинг: $data');
-      
-      final parts = data.replaceAll('SENSORS:', '').split(',');
-      Map<String, double> sensors = {};
-      
-      for (var part in parts) {
-        final pair = part.split(':');
-        if (pair.length == 2) {
-          final name = pair[0].trim();
-          final value = double.tryParse(pair[1].trim()) ?? 0.0;
-          sensors[name] = value;
-          debugPrint('  $name = $value см');
-        }
+
+  static void _parseMessage(String message) {
+    if (message.startsWith("SENSORS:")) {
+      _parseSensorData(message);
+    } else if (message.startsWith("ALERT:")) {
+      _alertController.add(message.replaceAll("ALERT:", ""));
+    } else if (message.startsWith("STATE:")) {
+      _parseStateUpdate(message);
+    } else if (message.startsWith("FULLSTATUS:")) {
+      _parseFullStatus(message);
+    } else if (message.startsWith("STATUS:ALARM_RESET")) {
+      sendCommand('GET_STATUS');
+    }
+    // Игнорируем OK, READY и другие служебные сообщения
+  }
+
+  static void _parseStateUpdate(String msg) {
+    final body = msg.replaceAll("STATE:", "");
+    
+    if (body.startsWith("LED")) {
+      final match = RegExp(r'LED(\d)_(ON|OFF)').firstMatch(body);
+      if (match != null) {
+        int idx = int.parse(match.group(1)!) - 1;
+        bool state = match.group(2) == 'ON';
+        _stateController.add(DeviceState(type: 'led', index: idx, value: state ? 1 : 0));
       }
-      
-      // Отправляем данные в stream
-      if (sensors.isNotEmpty) {
-        _sensorDataController.add(sensors);
+    } else if (body.startsWith("BUZZER")) {
+      final match = RegExp(r'BUZZER(\d)_(ON|OFF)').firstMatch(body);
+      if (match != null) {
+        int idx = int.parse(match.group(1)!) - 1;
+        bool state = match.group(2) == 'ON';
+        _stateController.add(DeviceState(type: 'buzzer', index: idx, value: state ? 1 : 0));
       }
-    } catch (e) {
-      debugPrint('Ошибка парсинга датчиков: $e');
+    } else if (body.startsWith("SERVO")) {
+      final match = RegExp(r'SERVO(\d)_(\d+)').firstMatch(body);
+      if (match != null) {
+        int idx = int.parse(match.group(1)!) - 1;
+        int angle = int.parse(match.group(2)!);
+        _stateController.add(DeviceState(type: 'servo', index: idx, value: angle));
+      }
+    } else if (body.startsWith("SENSOR")) {
+      final match = RegExp(r'SENSOR(\d)_(ON|OFF)').firstMatch(body);
+      if (match != null) {
+        int idx = int.parse(match.group(1)!);
+        bool state = match.group(2) == 'ON';
+        _stateController.add(DeviceState(type: 'sensor_enable', index: idx, value: state ? 1 : 0));
+      }
+    } else if (body.startsWith("ALL_SENSOR")) {
+      bool state = body.contains("ON");
+      for (int i = 0; i < 3; i++) {
+        _stateController.add(DeviceState(type: 'sensor_enable', index: i, value: state ? 1 : 0));
+      }
     }
   }
 
-  // Отключиться от устройства
+  static void _parseFullStatus(String msg) {
+    try {
+      final body = msg.replaceAll("FULLSTATUS:", "");
+      final parts = body.split(",");
+      
+      FullStatus status = FullStatus();
+      
+      for (int i = 0; i < parts.length; i++) {
+        var part = parts[i];
+        if (part.startsWith("LED:")) {
+          String ledStr = part.substring(4);
+          for (int j = 0; j < ledStr.length && j < 4; j++) {
+            status.leds[j] = ledStr[j] == '1';
+          }
+        } else if (part.startsWith("BUZ:")) {
+          String buzStr = part.substring(4);
+          for (int j = 0; j < buzStr.length && j < 3; j++) {
+            status.buzzers[j] = buzStr[j] == '1';
+          }
+        } else if (part.startsWith("SRV:")) {
+          status.servos[0] = int.tryParse(part.substring(4)) ?? 90;
+        } else if (part.startsWith("SNS:")) {
+          String snsStr = part.substring(4);
+          for (int j = 0; j < snsStr.length && j < 3; j++) {
+            status.sensorsEnabled[j] = snsStr[j] == '1';
+          }
+        } else if (part.startsWith("SEC:")) {
+          status.securityEnabled = part.substring(4) == '1';
+        } else if (part.startsWith("ALM:")) {
+          status.alarmActive = part.substring(4) == '1';
+        } else {
+          // Может быть второй угол серво
+          int? angle = int.tryParse(part);
+          if (angle != null && status.servos[1] == 90) {
+            status.servos[1] = angle;
+          }
+        }
+      }
+      
+      _fullStatusController.add(status);
+      print("📊 Полный статус: LED=${status.leds}, BUZ=${status.buzzers}, SRV=${status.servos}, SNS=${status.sensorsEnabled}");
+    } catch (e) {
+      print("Ошибка парсинга статуса: $e");
+    }
+  }
+
   static Future<void> disconnect() async {
     try {
       await _connection?.close();
-      _connection = null;
-      _isConnected = false;
-      _connectedDeviceName = '';
-      print('Bluetooth отключен');
-    } catch (e) {
-      print('Ошибка отключения: $e');
-    }
+    } catch (_) {}
+    _connection = null;
+    _isConnected = false;
+    _connectedDeviceName = '';
+    _inputBuffer = '';
   }
 
-  // Отправить команду на Arduino
   static Future<bool> sendCommand(String command) async {
-    debugPrint('=== SEND COMMAND START ===');
-    debugPrint('Connected: $_isConnected');
-    debugPrint('Connection: ${_connection != null}');
-    debugPrint('Command: $command');
-    
+    print("➡ SEND: $command");
+
     if (!_isConnected || _connection == null) {
-      debugPrint('❌ НЕТ ПОДКЛЮЧЕНИЯ К BLUETOOTH');
+      print("⚠ Офлайн, в очередь: $command");
+      _pendingCommands.add(command);
       return false;
     }
 
     try {
-      debugPrint('📤 Отправка команды: $command');
-      
-      final data = utf8.encode(command + '\n');
-      debugPrint('Encoded data: $data');
-      
+      final data = utf8.encode(command + "\n");
       _connection!.output.add(Uint8List.fromList(data));
       await _connection!.output.allSent;
-      
-      debugPrint('✅ КОМАНДА ОТПРАВЛЕНА: $command');
+      print("✅ Отправлено: $command");
       return true;
-    } catch (e, stackTrace) {
-      debugPrint('❌ ОШИБКА ОТПРАВКИ: $e');
-      debugPrint('Stack: $stackTrace');
+    } catch (e) {
+      print("❌ Ошибка: $command");
+      _pendingCommands.add(command);
       return false;
     }
   }
 
-  // Управление светодиодами (1-4)
-  static Future<bool> controlLed(int ledNumber, bool state) async {
-    debugPrint('🔦 ===== CONTROL LED START =====');
-    debugPrint('LED Number: $ledNumber');
-    debugPrint('State: ${state ? "ON" : "OFF"}');
-    
-    final command = 'LED${ledNumber}_${state ? "ON" : "OFF"}';
-    debugPrint('Command string: $command');
-    
-    final result = await sendCommand(command);
-    debugPrint('Result: $result');
-    debugPrint('🔦 ===== CONTROL LED END =====');
-    
-    return result;
-  }
-
-  // Управление баззерами (1-3)
-  static Future<bool> controlBuzzer(int buzzerNumber, bool state) async {
-    print('🔔 Попытка управления BUZZER$buzzerNumber: ${state ? "ON" : "OFF"}');
-    final command = 'BUZZER${buzzerNumber}_${state ? "ON" : "OFF"}';
-    return await sendCommand(command);
-  }
-
-  // Управление серво моторами (1-2)
-  static Future<bool> controlServo(int servoNumber, int angle) async {
-    print('🎛️ Попытка управления SERVO$servoNumber: $angle°');
-    final command = 'SERVO${servoNumber}_$angle';
-    return await sendCommand(command);
-  }
-
-  // Получить данные с ультразвуковых датчиков
-  static Future<Map<String, double>?> getSensorData() async {
-    if (!_isConnected || _connection == null) {
-      return null;
+  static void _flushPending() {
+    print("📤 Очередь: ${_pendingCommands.length}");
+    for (final cmd in _pendingCommands) {
+      try {
+        final data = utf8.encode(cmd + "\n");
+        _connection!.output.add(Uint8List.fromList(data));
+      } catch (_) {}
     }
+    _pendingCommands.clear();
+  }
 
+  static void _parseSensorData(String input) {
     try {
-      await sendCommand('GET_SENSORS');
-      
-      return {
-        'S0': 0.0,
-        'S1': 0.0,
-        'S2': 0.0,
-      };
+      final body = input.replaceAll("SENSORS:", "");
+      final parts = body.split(",");
+      Map<String, double> out = {};
+
+      for (var p in parts) {
+        if (p.contains(":")) {
+          final item = p.split(":");
+          if (item.length == 2 && item[0].startsWith("S")) {
+            out[item[0]] = double.tryParse(item[1]) ?? 0.0;
+          }
+        }
+      }
+      if (out.isNotEmpty) {
+        _sensorDataController.add(out);
+      }
     } catch (e) {
-      print('Ошибка чтения данных: $e');
-      return null;
+      print("Ошибка разбора датчиков: $e");
     }
   }
 
-  // Экстренная остановка всей системы
-  static Future<bool> emergencyStop() async {
-    return await sendCommand('EMERGENCY_STOP');
-  }
+  // === API ===
+  static Future<bool> controlLed(int id, bool state) =>
+      sendCommand("LED${id}_${state ? 'ON' : 'OFF'}");
 
+  static Future<bool> controlBuzzer(int id, bool state) =>
+      sendCommand("BUZZER${id}_${state ? 'ON' : 'OFF'}");
+
+  static Future<bool> controlServo(int id, int angle) =>
+      sendCommand("SERVO${id}_$angle");
+
+  // Индекс 0-based для сенсоров
+  static Future<bool> controlSensor(int id, bool enabled) =>
+      sendCommand("SENSOR${id}_${enabled ? 'ON' : 'OFF'}");
+
+  static Future<bool> resetAlarm() => sendCommand("RESET_ALARM");
+  static Future<bool> getStatus() => sendCommand("GET_STATUS");
+  
   // Включить/выключить систему охраны
-  static Future<bool> toggleSecurity(bool enable) async {
-    final command = enable ? 'SECURITY_ON' : 'SECURITY_OFF';
-    return await sendCommand(command);
-  }
+  static Future<bool> toggleSecurity(bool active) =>
+      sendCommand(active ? "SECURITY_ON" : "SECURITY_OFF");
+  
+  // Экстренная остановка (теперь просто сброс тревоги)
+  static Future<bool> emergencyStop() => sendCommand("RESET_ALARM");
+}
 
-  // Установить дистанцию обнаружения
-  static Future<bool> setDetectionDistance(int distance) async {
-    final command = 'DISTANCE_$distance';
-    return await sendCommand(command);
-  }
+class DeviceState {
+  final String type;
+  final int index;
+  final int value;
+  DeviceState({required this.type, required this.index, required this.value});
+}
 
-  // Сбросить тревогу
-  static Future<bool> resetAlarm() async {
-    return await sendCommand('RESET_ALARM');
-  }
-
-  // Получить статус системы
-  static Future<bool> getStatus() async {
-    return await sendCommand('GET_STATUS');
-  }
+class FullStatus {
+  List<bool> leds = [false, false, false, false];
+  List<bool> buzzers = [false, false, false];
+  List<int> servos = [90, 90];
+  List<bool> sensorsEnabled = [true, true, true];
+  bool securityEnabled = true;
+  bool alarmActive = false;
 }

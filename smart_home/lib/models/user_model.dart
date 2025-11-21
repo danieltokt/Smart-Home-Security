@@ -1,3 +1,6 @@
+// lib/models/user_model.dart
+// ТОЛЬКО класс User - ничего больше!
+
 class User {
   final String name;
   final String password;
@@ -41,8 +44,9 @@ class User {
     };
   }
 
-  // User A - полный доступ
-  static User userA = User(
+  // ===== ДЕФОЛТНЫЕ ПОЛЬЗОВАТЕЛИ =====
+
+  static User get defaultUserA => User(
     name: 'UserA',
     password: '1111',
     canControlSensors: true,
@@ -51,8 +55,7 @@ class User {
     canControlLeds: true,
   );
 
-  // User B - только сенсоры
-  static User userB = User(
+  static User get defaultUserB => User(
     name: 'UserB',
     password: '2222',
     canControlSensors: true,
@@ -61,8 +64,7 @@ class User {
     canControlLeds: false,
   );
 
-  // User C - серво и баззеры
-  static User userC = User(
+  static User get defaultUserC => User(
     name: 'UserC',
     password: '3333',
     canControlSensors: false,
@@ -71,8 +73,7 @@ class User {
     canControlLeds: false,
   );
 
-  // User D (Admin) - только управление правами
-  static User admin = User(
+  static User get admin => User(
     name: 'Admin',
     password: 'admin',
     isAdmin: true,
