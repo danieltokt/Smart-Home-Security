@@ -2,7 +2,8 @@
 
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'services/auth_service.dart';  // AuthService
+import 'services/auth_service.dart';
+import 'services/localization_service.dart';
 import 'screens/login_screen.dart';
 import 'screens/admin_screen.dart';
 import 'screens/user_screen.dart';
@@ -10,11 +11,12 @@ import 'screens/user_screen.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  // Запрос Bluetooth разрешений (не блокирует приложение)
+  // Запрос Bluetooth разрешений
   _requestPermissions();
   
-  // Инициализация AuthService (загрузка пользователей из SharedPreferences)
+  // Инициализация сервисов
   await AuthService.init();
+  await LocalizationService().init();
   
   runApp(const SmartHomeApp());
 }
